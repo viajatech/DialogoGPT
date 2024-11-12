@@ -1,0 +1,209 @@
+#pip install transformers torch tkinter tqdm requests
+
+import tkinter as tk
+from tkinter import ttk
+from tkinter.scrolledtext import ScrolledText
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+import threading
+import time
+import requests
+from pathlib import Path
+from tqdm.auto import tqdm
+import os
+
+# Configurar dispositivo (GPU si está disponible)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# Variables globales para el modelo y el tokenizador
+model = None
+tokenizer = None
+model_name = "microsoft/DialoGPT-medium"
+
+# Historial de conversación
+chat_history_ids = None
+step = 0  # Contador de turnos de conversación
+
+def download_model_files():
+    # Función para descargar los archivos del modelo y mostrar progreso
+    model_dir = Path(f"./{model_name.replace('/', '_')}")
+    model_dir.mkdir(parents=True, exist_ok=True)
+    base_url = f"https://huggingface.co/{model_name}/resolve/main/"
+
+    files = [
+        "config.json",
+        "pytorch_model.bin",
+        "merges.txt",
+        "vocab.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json"
+    ]
+
+    total_size = 0
+    downloaded_size = 0
+
+    # Obtener el tamaño total de los archivos
+    for file in files:
+        url = base_url + file
+        response = requests.head(url)
+        if response.status_code == 200:
+            total_size += int(response.headers.get('Content-Length', 0))
+
+    total_size_mb = total_size / (1024 * 1024)
+    start_time = time.time()
+
+    log_text.insert(tk.END, f"Tamaño total de descarga: {total_size_mb:.2f} MB\n")
+    log_text.see(tk.END)
+
+    # Descargar los archivos con progreso
+    for file in files:
+        url = base_url + file
+        local_file = model_dir / file
+
+        if local_file.exists():
+            downloaded_size += local_file.stat().st_size
+            continue
+
+        with requests.get(url, stream=True) as r:
+            if r.status_code == 200:
+                file_size = int(r.headers.get('Content-Length', 0))
+                progress = tqdm(
+                    total=file_size, unit='B', unit_scale=True, desc=file, leave=False
+                )
+                with open(local_file, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+                            progress.update(len(chunk))
+
+                            # Actualizar logs
+                            downloaded_size += len(chunk)
+                            elapsed_time = time.time() - start_time
+                            speed = downloaded_size / elapsed_time  # Bytes por segundo
+                            remaining_size = total_size - downloaded_size
+                            eta = remaining_size / speed if speed > 0 else 0
+
+                            log_text.delete('1.0', tk.END)
+                            log_text.insert(tk.END, f"Descargando: {file}\n")
+                            log_text.insert(tk.END, f"Progreso total: {downloaded_size / (1024*1024):.2f} MB de {total_size / (1024*1024):.2f} MB\n")
+                            log_text.insert(tk.END, f"Velocidad: {speed / (1024*1024):.2f} MB/s\n")
+                            log_text.insert(tk.END, f"Tiempo restante estimado: {eta:.2f} segundos\n")
+                            log_text.see(tk.END)
+                progress.close()
+            else:
+                log_text.insert(tk.END, f"Error al descargar {file}\n")
+    return model_dir
+
+def load_model():
+    global model, tokenizer
+
+    log_text.insert(tk.END, "Descargando y cargando el modelo...\n")
+    log_text.see(tk.END)
+    model_dir = download_model_files()
+
+    # Cargar el modelo y el tokenizador
+    start_time = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = AutoModelForCausalLM.from_pretrained(model_dir).to(device)
+    model.eval()
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+
+    log_text.insert(tk.END, f"Modelo cargado en {elapsed_time:.2f} segundos.\n")
+    log_text.insert(tk.END, "Abriendo la interfaz de chat...\n")
+    log_text.see(tk.END)
+
+    # Después de cargar el modelo, iniciar la interfaz gráfica
+    root.after(1000, open_chat_gui)
+
+def open_chat_gui():
+    root.destroy()
+    chat_gui = tk.Tk()
+    chat_gui.title("Chatbot con DialoGPT")
+    chat_gui.configure(bg='black')
+    chat_gui.geometry('800x600')
+
+    chat_log = ScrolledText(
+        chat_gui, state=tk.DISABLED, bg='black', fg='white', wrap=tk.WORD
+    )
+    chat_log.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+    user_entry = tk.Entry(chat_gui, width=100, bg='gray20', fg='white')
+    user_entry.pack(padx=10, pady=(0,10), fill=tk.X)
+    user_entry.focus()
+
+    # Vincular la tecla Enter para enviar mensajes
+    user_entry.bind('<Return>', lambda event: generate_response(user_entry, chat_log))
+
+    send_button = tk.Button(
+        chat_gui, text="Enviar",
+        command=lambda: generate_response(user_entry, chat_log),
+        bg='gray30', fg='white'
+    )
+    send_button.pack(pady=(0,10))
+
+    chat_gui.mainloop()
+
+def generate_response(user_entry, chat_log):
+    global chat_history_ids, step
+    user_input = user_entry.get()
+    user_entry.delete(0, tk.END)
+
+    chat_log.config(state=tk.NORMAL)
+    chat_log.insert(tk.END, f"Tú: {user_input}\n")
+    chat_log.config(state=tk.DISABLED)
+    chat_log.see(tk.END)
+
+    # Función para ejecutar en un hilo separado
+    def run_model():
+        global chat_history_ids, step
+        with torch.no_grad():
+            new_user_input_ids = tokenizer.encode(user_input + tokenizer.eos_token, return_tensors='pt').to(device)
+            if step == 0:
+                chat_history_ids = model.generate(
+                    new_user_input_ids,
+                    max_length=1000,
+                    pad_token_id=tokenizer.eos_token_id,
+                    no_repeat_ngram_size=3,
+                    do_sample=True,
+                    top_k=50,
+                    top_p=0.95,
+                    temperature=0.7,
+                )
+            else:
+                chat_history_ids = model.generate(
+                    torch.cat([chat_history_ids, new_user_input_ids], dim=-1),
+                    max_length=1000,
+                    pad_token_id=tokenizer.eos_token_id,
+                    no_repeat_ngram_size=3,
+                    do_sample=True,
+                    top_k=50,
+                    top_p=0.95,
+                    temperature=0.7,
+                )
+            # Decodificar la respuesta
+            response = tokenizer.decode(chat_history_ids[:, new_user_input_ids.shape[-1]:][0], skip_special_tokens=True)
+
+            chat_log.config(state=tk.NORMAL)
+            chat_log.insert(tk.END, f"Bot: {response}\n\n")
+            chat_log.config(state=tk.DISABLED)
+            chat_log.see(tk.END)
+
+            step += 1
+
+    # Crear y empezar hilo para generar la respuesta
+    threading.Thread(target=run_model).start()
+
+# Ventana de LOGS
+root = tk.Tk()
+root.title("Cargando modelo - Chatbot con DialoGPT")
+root.geometry('600x400')
+
+log_text = tk.Text(root, state=tk.NORMAL)
+log_text.pack(padx=10, pady=10, fill=tk.BOTH, expand=True)
+
+# Iniciar carga del modelo en un hilo separado
+threading.Thread(target=load_model).start()
+
+root.mainloop()
+
